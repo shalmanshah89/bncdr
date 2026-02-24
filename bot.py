@@ -160,10 +160,11 @@ async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
     logger.info(f"Callback data: {callback.data}")
     user_id = callback.from_user.id
 
-    if not (user_id in ADMIN_IDS or callback.data in ["cancel_process", "back_main", "buy_deposit_now", "confirm_deposit"] or callback.data.startswith(("dep_", "appr_", "reje_", "buy_"))):
-        if callback.data.startswith(("ap_", "setprice_", "editprice_", "setformat_", "uploadproxy_", "deleteprovider_", "view_", "upload_method_")):
-            await callback.answer("Access Denied!")
-            return
+    if not (user_id in ADMIN_IDS or callback.data in ["cancel_process", "back_main", "buy_deposit_now", "confirm_deposit", "cancel_purchase"] or callback.data.startswith(("dep_", "appr_", "reje_"))):
+        if callback.data.startswith(("ap_", "setprice_", "editprice_", "setformat_", "uploadproxy_", "deleteprovider_", "view_", "upload_method_", "askbuy_", "procbuy_")):
+            if not callback.data.startswith(("askbuy_", "procbuy_", "cancel_purchase")):
+                await callback.answer("Access Denied!")
+                return
 
     if callback.data == "cancel_process":
         await state.finish()
@@ -536,179 +537,397 @@ async def process_package_price(message: types.Message, state: FSMContext):
         reply_markup=admin_inline_menu()
     )
 
-def is_valid_format(proxy_line):
+def is_valid_proxy_format(proxy_line):
+    """Check if proxy line has valid format: IP:PORT:USER:PASS"""
+    if not proxy_line or not isinstance(proxy_line, str):
+        return False
+    proxy_line = proxy_line.strip()
+    if not proxy_line or proxy_line.startswith('#'):
+        return False
     parts = proxy_line.split(':')
-    return len(parts) == 4
+    if len(parts) != 4:
+        return False
+    ip, port, user, password = parts
+    if not ip or not port or not user or not password:
+        return False
+    try:
+        int(port)
+    except:
+        return False
+    return True
 
 @dp.message_handler(state=ProviderState.waiting_proxy_text)
 async def process_proxy_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
     provider = data.get("selected_provider")
-    proxy_list = message.text.splitlines()
+    
+    if not provider:
+        await message.answer("❌ Provider not selected!")
+        await state.finish()
+        return
+
+    proxy_text = message.text.strip()
+    proxy_lines = proxy_text.split('\n')
 
     current_db = load_db()
+    
     if provider not in current_db:
         current_db[provider] = {"proxies": [], "packages": {}, "formats": []}
+    
     if "proxies" not in current_db[provider]:
         current_db[provider]["proxies"] = []
 
-    valid_count = 0
-    for line in proxy_list:
+    valid_proxies = []
+    invalid_lines = []
+    
+    for idx, line in enumerate(proxy_lines, 1):
         line = line.strip()
-        if is_valid_format(line):
-            p = line.split(':')
-            proxy_data = {"ip": p[0], "port": p[1], "user": p[2], "pass": p[3]}
-            current_db[provider]["proxies"].append(proxy_data)
-            valid_count += 1
+        if not line:
+            continue
+            
+        if is_valid_proxy_format(line):
+            parts = line.split(':')
+            proxy_data = {
+                "ip": parts[0].strip(),
+                "port": parts[1].strip(),
+                "user": parts[2].strip(),
+                "pass": parts[3].strip()
+            }
+            valid_proxies.append(proxy_data)
+        else:
+            invalid_lines.append(f"Line {idx}: {line}")
 
-    if valid_count > 0:
+    if valid_proxies:
+        current_db[provider]["proxies"].extend(valid_proxies)
         save_db(current_db)
+        
         await state.finish()
-        await message.answer(f"✅ {valid_count} Proxies added to {provider}!", reply_markup=admin_inline_menu())
+        
+        response_msg = f"✅ Success!\n\n"
+        response_msg += f"✅ Added: {len(valid_proxies)} proxies\n"
+        response_msg += f"Provider: {provider}\n"
+        
+        if invalid_lines:
+            response_msg += f"\n⚠️ Skipped: {len(invalid_lines)} invalid lines\n"
+            for line in invalid_lines[:5]:
+                response_msg += f"  • {line}\n"
+            if len(invalid_lines) > 5:
+                response_msg += f"  ... and {len(invalid_lines) - 5} more\n"
+        
+        await message.answer(response_msg, reply_markup=admin_inline_menu())
     else:
-        await message.answer("❌ Invalid Format! Please use IP:PORT:USER:PASS")
+        await message.answer(
+            f"❌ Invalid Format!\n\n"
+            f"Required Format: IP:PORT:USER:PASS\n\n"
+            f"Example:\n"
+            f"192.168.1.1:8080:user:pass\n"
+            f"10.0.0.1:3128:admin:password\n\n"
+            f"Please try again:",
+            reply_markup=cancel_keyboard()
+        )
 
 @dp.message_handler(content_types=['document'], state=ProviderState.waiting_proxy_file)
 async def process_proxy_file(message: types.Message, state: FSMContext):
     data = await state.get_data()
     provider = data.get("selected_provider")
-
-    file_info = await bot.get_file(message.document.file_id)
-    downloaded_file = await bot.download_file(file_info.file_path)
-    content = downloaded_file.read().decode('utf-8')
-
-    proxy_list = content.splitlines()
-    valid_proxies = []
-
-    for line in proxy_list:
-        line = line.strip()
-        if is_valid_format(line):
-            p = line.split(':')
-            proxy_data = {"ip": p[0], "port": p[1], "user": p[2], "pass": p[3]}
-            valid_proxies.append(proxy_data)
-
-    if not valid_proxies:
-        await message.answer("❌ File contains no valid format proxies!", reply_markup=cancel_keyboard())
+    
+    if not provider:
+        await message.answer("❌ Provider not selected!")
+        await state.finish()
         return
 
-    current_db = load_db()
-    if provider not in current_db:
-        current_db[provider] = {"proxies": [], "packages": {}, "formats": []}
-    if "proxies" not in current_db[provider]:
-        current_db[provider]["proxies"] = []
+    try:
+        file_info = await bot.get_file(message.document.file_id)
+        downloaded_file = await bot.download_file(file_info.file_path)
+        content = downloaded_file.read().decode('utf-8', errors='ignore')
+        
+        proxy_lines = content.split('\n')
+        
+        current_db = load_db()
+        
+        if provider not in current_db:
+            current_db[provider] = {"proxies": [], "packages": {}, "formats": []}
+        
+        if "proxies" not in current_db[provider]:
+            current_db[provider]["proxies"] = []
 
-    current_db[provider]["proxies"].extend(valid_proxies)
-    save_db(current_db)
+        valid_proxies = []
+        invalid_count = 0
+        
+        for line in proxy_lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+                
+            if is_valid_proxy_format(line):
+                parts = line.split(':')
+                proxy_data = {
+                    "ip": parts[0].strip(),
+                    "port": parts[1].strip(),
+                    "user": parts[2].strip(),
+                    "pass": parts[3].strip()
+                }
+                valid_proxies.append(proxy_data)
+            else:
+                invalid_count += 1
 
-    await state.finish()
-    await message.answer(f"✅ {len(valid_proxies)} Proxies added from file to {provider}!", reply_markup=admin_inline_menu())
+        if valid_proxies:
+            current_db[provider]["proxies"].extend(valid_proxies)
+            save_db(current_db)
+            
+            await state.finish()
+            
+            response_msg = f"✅ File Upload Success!\n\n"
+            response_msg += f"✅ Added: {len(valid_proxies)} proxies\n"
+            response_msg += f"Provider: {provider}\n"
+            response_msg += f"File: {message.document.file_name}\n"
+            
+            if invalid_count > 0:
+                response_msg += f"\n⚠️ Skipped: {invalid_count} invalid lines\n"
+            
+            await message.answer(response_msg, reply_markup=admin_inline_menu())
+        else:
+            await message.answer(
+                f"❌ No valid proxies found in file!\n\n"
+                f"Required Format: IP:PORT:USER:PASS\n\n"
+                f"Example:\n"
+                f"192.168.1.1:8080:user:pass\n"
+                f"10.0.0.1:3128:admin:password",
+                reply_markup=cancel_keyboard()
+            )
+
+    except Exception as e:
+        logger.error(f"Error processing proxy file: {str(e)}")
+        await message.answer(
+            f"❌ Error processing file: {str(e)}\n\n"
+            f"Make sure file is .txt format",
+            reply_markup=cancel_keyboard()
+        )
 
 @dp.message_handler(lambda m: m.text == "🛒 Buy Proxy")
 async def buy_proxy_handler(message: types.Message):
     current_db = load_db()
     kb = InlineKeyboardMarkup(row_width=1)
-    
-    # We look for providers inside the "providers" key or the root
-    data_source = current_db.get("providers", current_db)
-    
+
     found = False
-    for name, data in data_source.items():
-        if name == "users": continue # Skip the user balance section
-        
-        packages = data.get("packages", {})
-        proxies = data.get("proxies", [])
-        
-        if proxies and packages:
+    for provider_name in list(current_db.keys()):
+        provider_data = current_db.get(provider_name, {})
+        packages = provider_data.get("packages", {})
+        proxies = provider_data.get("proxies", [])
+
+        if packages and proxies and len(proxies) > 0:
             for gb, price in packages.items():
-                # Clean the price string (e.g., "$1" -> "1")
-                btn_text = f"{name} {gb} ({price})"
-                kb.add(InlineKeyboardButton(btn_text, callback_data=f"askbuy_{name}_{gb}"))
+                btn_text = f"{provider_name} {gb} {price}"
+                safe_prov = provider_name.replace(" ", "_").replace("@", "AT")
+                safe_gb = str(gb).replace(" ", "_")
+                callback_data = f"askbuy_{safe_prov}_{safe_gb}"
+                kb.add(InlineKeyboardButton(btn_text, callback_data=callback_data))
                 found = True
-    
+
     if not found:
-        await message.answer("❌ No proxies available in stock.")
+        await message.answer("❌ No proxies available at the moment.")
     else:
-        await message.answer("📡 **Available Proxies:**", reply_markup=kb, parse_mode="Markdown")
+        await message.answer("📡 Available Proxies:", reply_markup=kb)
 
-# Step 1: Show Confirmation
-@dp.callback_query_handler(lambda c: c.data.startswith("askbuy_"), state="*")
+@dp.callback_query_handler(lambda c: c.data.startswith("askbuy_"))
 async def confirm_purchase_prompt(callback: types.CallbackQuery):
-    _, provider, gb = callback.data.split("_")
-    
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Confirm Buy", callback_data=f"procbuy_{provider}_{gb}"),
-        InlineKeyboardButton("❌ Cancel", callback_data="cancel_purchase")
-    )
-    
-    await callback.message.edit_text(
-        f"⚠️ **Confirm Purchase**\n\nPackage: {provider} {gb}\n\nDo you want to proceed?",
-        reply_markup=kb, parse_mode="Markdown"
-    )
-    await callback.answer()
+    try:
+        callback_str = callback.data.replace("askbuy_", "")
+        parts = callback_str.rsplit("_", 1)
+        
+        if len(parts) != 2:
+            await callback.answer("Invalid data!", show_alert=True)
+            return
 
-# Step 2: Deduct Balance and Send Proxy
-@dp.callback_query_handler(lambda c: c.data.startswith("procbuy_"), state="*")
+        provider = parts[0].replace("_", " ").replace("AT", "@")
+        gb = parts[1].replace("_", " ")
+
+        db = load_db()
+        
+        if provider not in db:
+            await callback.answer("Provider not found!", show_alert=True)
+            return
+
+        provider_data = db.get(provider, {})
+        packages = provider_data.get("packages", {})
+        
+        if gb not in packages:
+            await callback.answer(f"Package not found!", show_alert=True)
+            return
+
+        price = packages[gb]
+
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("✅ Confirm Buy", callback_data=f"procbuy_{provider}_{gb}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_purchase")
+        )
+
+        confirm_text = (
+            f"⚠️ Confirm Purchase\n\n"
+            f"Provider: {provider}\n"
+            f"Package: {gb}\n"
+            f"Price: {price}\n\n"
+            f"Do you want to proceed?"
+        )
+
+        await callback.message.edit_text(confirm_text, reply_markup=kb)
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"Error in confirm_purchase_prompt: {str(e)}")
+        await callback.answer(f"Error: {str(e)}", show_alert=True)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("procbuy_"))
 async def process_proxy_purchase(callback: types.CallbackQuery):
-    user_id = str(callback.from_user.id)
-    _, provider, gb = callback.data.split("_")
-    
-    db = load_db()
-    
-    # Locate user and provider safely
-    users_section = db.get("users", db)
-    providers_section = db.get("providers", db)
-    
-    user_data = users_section.get(user_id, {"balance": "0.0000"})
-    provider_data = providers_section.get(provider, {})
-    
-    # Get Price
-    price_str = provider_data.get("packages", {}).get(gb, "0").replace("$", "")
-    price = float(price_str)
-    balance = float(user_data.get("balance", 0))
+    try:
+        user_id = str(callback.from_user.id)
+        callback_str = callback.data.replace("procbuy_", "")
+        parts = callback_str.rsplit("_", 1)
+        
+        if len(parts) != 2:
+            await callback.answer("Invalid data!", show_alert=True)
+            return
 
-    if balance < price:
-        await callback.message.edit_text(f"❌ **Insufficient Balance!**\nPrice: ${price}\nYour Balance: ${balance}")
-        return
+        provider = parts[0]
+        gb = parts[1]
 
-    # Get Proxy
-    proxies = provider_data.get("proxies", [])
-    if not proxies:
-        await callback.message.edit_text("❌ **Out of Stock!**")
-        return
+        logger.info(f"Processing purchase: User={user_id}, Provider={provider}, GB={gb}")
 
-    # Take first proxy and update DB
-    selected_proxy = proxies.pop(0) 
-    new_balance = balance - price
+        db = load_db()
 
-    # Save back to database
-    if "users" in db:
-        db["users"][user_id]["balance"] = f"{new_balance:.4f}"
-    else:
+        # User balance check
+        if user_id not in db:
+            db[user_id] = {"balance": "0.0000"}
+            save_db(db)
+
+        user_data = db.get(user_id, {"balance": "0.0000"})
+        
+        # Provider data check
+        if provider not in db:
+            logger.error(f"Provider {provider} not found in database")
+            await callback.message.edit_text(f"❌ Provider '{provider}' not found!")
+            await callback.answer()
+            return
+
+        provider_data = db[provider]
+        
+        logger.info(f"Provider data: {provider_data}")
+
+        # Get package price
+        packages = provider_data.get("packages", {})
+        
+        if gb not in packages:
+            logger.error(f"Package {gb} not found in {provider}. Available: {list(packages.keys())}")
+            await callback.message.edit_text(f"❌ Package '{gb}' not available!")
+            await callback.answer()
+            return
+
+        price_str = str(packages[gb]).replace("$", "").replace(" ", "").strip()
+        
+        try:
+            price = float(price_str) if price_str else 0.0
+        except Exception as e:
+            logger.error(f"Price conversion error: {price_str} - {str(e)}")
+            price = 0.0
+
+        # Get user balance
+        balance_str = str(user_data.get("balance", "0")).strip()
+        try:
+            balance = float(balance_str)
+        except:
+            balance = 0.0
+
+        logger.info(f"Balance check: User balance={balance}, Price={price}")
+
+        # Check balance
+        if balance < price:
+            msg_text = (
+                f"❌ Insufficient Balance!\n\n"
+                f"Price: ${price:.4f}\n"
+                f"Your Balance: ${balance:.4f}\n"
+                f"Needed: ${price - balance:.4f}"
+            )
+            await callback.message.edit_text(msg_text)
+            await callback.answer()
+            return
+
+        # Get proxies
+        proxies = provider_data.get("proxies", [])
+        
+        logger.info(f"Available proxies: {len(proxies)}")
+
+        if not proxies or len(proxies) == 0:
+            await callback.message.edit_text(
+                f"❌ Out of Stock!\n\n"
+                f"Provider: {provider}\n"
+                f"Package: {gb}\n\n"
+                f"No proxies available at the moment."
+            )
+            await callback.answer()
+            return
+
+        # Take first proxy
+        selected_proxy = proxies.pop(0)
+        new_balance = balance - price
+
+        logger.info(f"Selected proxy: {selected_proxy}")
+
+        # Update database
         db[user_id]["balance"] = f"{new_balance:.4f}"
-        
-    if "providers" in db:
-        db["providers"][provider]["proxies"] = proxies
-    else:
         db[provider]["proxies"] = proxies
-        
-    save_db(db)
+        save_db(db)
 
-    # Output Format: IP:PORT:USER:PASS
-    if isinstance(selected_proxy, dict):
-        p_out = f"{selected_proxy['ip']}:{selected_proxy['port']}:{selected_proxy['user']}:{selected_proxy['pass']}"
-    else:
-        p_out = str(selected_proxy)
+        logger.info(f"Database updated. Remaining proxies: {len(proxies)}")
 
-    await callback.message.edit_text(
-        f"✅ **Purchase Successful!**\n\n"
-        f"🚀 **Your Proxy:**\n`{p_out}`\n\n"
-        f"💰 Remaining Balance: ${new_balance:.4f}",
-        parse_mode="Markdown"
-    )
-    await callback.answer()
+        # Format proxy string
+        if isinstance(selected_proxy, dict):
+            proxy_str = (
+                f"{selected_proxy.get('ip', 'N/A')}:"
+                f"{selected_proxy.get('port', 'N/A')}:"
+                f"{selected_proxy.get('user', 'N/A')}:"
+                f"{selected_proxy.get('pass', 'N/A')}"
+            )
+        else:
+            proxy_str = str(selected_proxy)
 
-@dp.callback_query_handler(lambda c: c.data == "cancel_purchase", state="*")
+        logger.info(f"Proxy string: {proxy_str}")
+
+        # Success message
+        success_msg = (
+            f"✅ Purchase Successful!\n\n"
+            f"🚀 Your Proxy:\n"
+            f"`{proxy_str}`\n\n"
+            f"Package: {provider} {gb}\n"
+            f"💰 Price: ${price:.4f}\n"
+            f"Remaining Balance: ${new_balance:.4f}"
+        )
+
+        await callback.message.edit_text(success_msg, parse_mode="Markdown")
+        await callback.answer()
+
+        # Send confirmation to user
+        try:
+            confirm_msg = (
+                f"✅ Your proxy purchase is complete!\n\n"
+                f"{proxy_str}\n\n"
+                f"Provider: {provider}\n"
+                f"Package: {gb}\n"
+                f"Remaining Balance: ${new_balance:.4f}"
+            )
+            await bot.send_message(user_id, confirm_msg)
+        except Exception as e:
+            logger.error(f"Error sending confirmation: {str(e)}")
+
+    except Exception as e:
+        logger.error(f"Error in process_proxy_purchase: {str(e)}")
+        logger.error(f"Callback data: {callback.data}")
+        import traceback
+        logger.error(traceback.format_exc())
+        await callback.message.edit_text(f"❌ Error: {str(e)}")
+        await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "cancel_purchase")
 async def cancel_purchase_logic(callback: types.CallbackQuery):
     await callback.message.edit_text("❌ Purchase cancelled.")
     await callback.answer()
